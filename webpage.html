@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recipe & Ingredient Manager</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for aesthetic appeal */
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .card { background-color: #161b22; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.2); }
+        .btn-primary { background-color: #238636; color: white; transition: background-color 0.2s; }
+        .btn-primary:hover { background-color: #2ea043; }
+        .input-style { background-color: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; padding: 0.5rem; }
+        .nav-button.active { background-color: #21262d; border-bottom: 2px solid #238636; }
+        /* Style for the loading spinner */
+        .spinner { border: 4px solid rgba(255, 255, 255, 0.1); border-top: 4px solid #238636; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin: auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+    <!-- Load Firebase Scripts -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, collection, doc, onSnapshot, 
+            addDoc, setDoc, updateDoc, deleteDoc, query, where, getDocs, runTransaction 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Use 'Debug' for development, remove for production
+        setLogLevel('Debug');
+
+        // --- GLOBAL SETUP (MANDATORY CANVAS VARIABLES) ---
+        // CRITICAL FIX: Ensure Canvas variables are handled correctly for local execution.
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        // DUMMY CONFIGURATION for running the app outside of the Canvas environment
+        const localDummyConfig = {
+            apiKey: "LOCAL_DUMMY_KEY",
+            authDomain: "local-dummy.firebaseapp.com",
+            projectId: "local-dummy-project",
+            storageBucket: "local-dummy.appspot.com",
+            messagingSenderId: "123456789012",
+            appId: "1:123456789012:web:abcdef1234567890abcdef"
+        };
+
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : localDummyConfig;
+
+        let db = null;
+        let auth = null;
+        let userId = null;
+        let isAuthReady = false;
+
+        // --- APPLICATION STATE ---
+        window.appState = {
+            view: 'recipes', // recipes, inventory, meal_plan, reports
+            recipes: [],
+            inventory: {}, // Map for easy lookup: {name: {quantity, unit}}
+            mealPlan: {} // Map: {day: {recipeId, title}}
+        };
+
+        // --- FIREBASE INITIALIZATION & AUTHENTICATION ---
+        async function initializeFirebase() {
+            
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+
+            // Set up Auth State Listener
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('user-id-display').textContent = `User ID: ${userId} (${initialAuthToken ? 'CANVAS AUTH' : 'ANON AUTH'})`;
+                    isAuthReady = true;
+                    // Once authenticated, start listening to data
+                    setupDataListeners(); 
+                } else {
+                    // Try to sign in with custom token (only works in Canvas) or anonymously (fallback for local)
+                    try {
+                        if (initialAuthToken) {
+                            await signInWithCustomToken(auth, initialAuthToken);
+                            console.log("✅ Signed in with Canvas Custom Token.");
+                        } else {
+                            await signInAnonymously(auth);
+                            console.log("ℹ️ Signed in anonymously (for local testing). Data will not persist to the Canvas environment.");
+                        }
+                    } catch (error) {
+                        console.error("Firebase Auth Error:", error);
+                        // Fallback to anonymous sign-in if custom token fails
+                        if (!user) { // Only try anonymous if still not signed in
+                             await signInAnonymously(auth);
+                        }
+                    }
+                }
+            });
+
+            // Display warning if using dummy config
+            if (firebaseConfig === localDummyConfig) {
+                 showMessage('Running locally: Using dummy config. Data is NOT persistent or shared.', 'info');
+                 console.warn("⚠️ Using local dummy Firebase config. Data will not persist to the Canvas environment.");
+            }
+        }
+        
+        // --- FIREBASE PATH HELPERS ---
+        // NOTE: This path is for the Canvas environment, but we must keep it for structure.
+        const getPrivatePath = (collectionName) => `/artifacts/${appId}/users/${userId}/${collectionName}`;
+
+        // --- REAL-TIME DATA LISTENERS (onSnapshot) ---
+        function setupDataListeners() {
+            if (!isAuthReady || !userId) return; // Guard against running before auth is ready
+
+            // Listener 1: Recipes Collection
+            onSnapshot(collection(db, getPrivatePath('recipes')), (snapshot) => {
+                window.appState.recipes = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                renderContent();
+            }, (error) => { console.error("Error fetching recipes:", error); });
+
+            // Listener 2: Inventory Collection
+            onSnapshot(collection(db, getPrivatePath('inventory')), (snapshot) => {
+                window.appState.inventory = {};
+                snapshot.docs.forEach(doc => {
+                    window.appState.inventory[doc.id] = doc.data();
+                });
+                renderContent();
+            }, (error) => { console.error("Error fetching inventory:", error); });
+            
+            // Listener 3: Meal Plan Collection
+            onSnapshot(collection(db, getPrivatePath('meal_plan')), (snapshot) => {
+                window.appState.mealPlan = {};
+                snapshot.docs.forEach(doc => {
+                    window.appState.mealPlan[doc.id] = doc.data();
+                });
+                renderContent();
+            }, (error) => { console.error("Error fetching meal plan:", error); });
+        }
+        
+        // --- MODULE 1: RECIPE CRUD OPERATIONS ---
+
+        window.addRecipe = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const title = form.title.value;
+            const cuisine = form.cuisine.value;
+            const servings = parseInt(form.servings.value);
+            
+            if (!title || isNaN(servings)) { showMessage('Please fill all fields', 'error'); return; }
+
+            // Temporary simple ingredient structure
+            const ingredients = [{ name: 'Placeholder Ingredient', quantity: 1, unit: 'unit' }];
+
+            try {
+                await addDoc(collection(db, getPrivatePath('recipes')), { 
+                    title, 
+                    cuisine, 
+                    servings, 
+                    ingredients: ingredients 
+                });
+                form.reset();
+                showMessage('Recipe added successfully!', 'success');
+            } catch (error) {
+                console.error("Error adding recipe: ", error);
+                showMessage('Failed to add recipe.', 'error');
+            }
+        };
+
+        window.deleteRecipe = async (id) => {
+            if (!confirmAction('Are you sure you want to delete this recipe?')) return;
+            try {
+                await deleteDoc(doc(db, getPrivatePath('recipes'), id));
+                showMessage('Recipe deleted!', 'success');
+            } catch (error) {
+                console.error("Error deleting recipe: ", error);
+                showMessage('Failed to delete recipe.', 'error');
+            }
+        };
+        
+        // --- MODULE 2: INVENTORY CRUD OPERATIONS ---
+
+        window.updateInventory = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const name = form.name.value.trim(); // Trim whitespace
+            const unit = form.unit.value.trim() || 'units';
+            const quantityChange = parseFloat(form.quantityChange.value);
+
+            if (!name || isNaN(quantityChange)) { showMessage('Invalid input.', 'error'); return; }
+
+            // Document ID is the ingredient name for fast lookup
+            const ingredientRef = doc(db, getPrivatePath('inventory'), name);
+
+            try {
+                await runTransaction(db, async (transaction) => {
+                    const docSnapshot = await transaction.get(ingredientRef);
+                    
+                    if (!docSnapshot.exists()) {
+                        if (quantityChange < 0) throw new Error("Cannot remove stock from non-existent item.");
+                        // Create new item
+                        transaction.set(ingredientRef, { 
+                            quantity: quantityChange, 
+                            unit: unit
+                        });
+                    } else {
+                        const currentQuantity = docSnapshot.data().quantity;
+                        const newQuantity = currentQuantity + quantityChange;
+                        if (newQuantity < 0) throw new Error(`Stock level for ${name} cannot go below 0.`);
+                        // Update existing item
+                        transaction.update(ingredientRef, { 
+                            quantity: newQuantity,
+                            unit: unit || docSnapshot.data().unit // Update unit only if provided
+                        });
+                    }
+                });
+                form.reset();
+                showMessage('Stock updated successfully!', 'success');
+            } catch (error) {
+                console.error("Inventory Transaction Error: ", error);
+                showMessage(`Transaction failed: ${error.message}`, 'error');
+            }
+        };
+        
+        // --- MODULE 3: MEAL PLANNER CRUD OPERATIONS ---
+        
+        window.setMealPlan = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            const day = form.day.value;
+            const recipeId = form.recipeId.value;
+            const recipe = window.appState.recipes.find(r => r.id === recipeId);
+
+            if (!day || !recipe) { showMessage('Invalid day or recipe selected.', 'error'); return; }
+
+            try {
+                // Document ID is the day (e.g., "Monday")
+                const planRef = doc(db, getPrivatePath('meal_plan'), day);
+                await setDoc(planRef, { 
+                    recipeId: recipe.id,
+                    title: recipe.title
+                });
+                showMessage(`${recipe.title} set for ${day}.`, 'success');
+            } catch (error) {
+                console.error("Error setting meal plan: ", error);
+                showMessage('Failed to set meal plan.', 'error');
+            }
+        };
+
+        window.clearMealPlan = async (day) => {
+            if (!confirmAction(`Are you sure you want to clear the plan for ${day}?`)) return;
+            try {
+                await deleteDoc(doc(db, getPrivatePath('meal_plan'), day));
+                showMessage(`Meal plan for ${day} cleared.`, 'success');
+            } catch (error) {
+                console.error("Error clearing meal plan: ", error);
+                showMessage('Failed to clear meal plan.', 'error');
+            }
+        };
+
+        // --- REPORTING & UI UTILITIES ---
+
+        function confirmAction(message) {
+            // Using a simple window.prompt as a non-alert/confirm dialog replacement
+            const result = prompt(`${message}\nType 'YES' to confirm:`);
+            return result && result.toUpperCase() === 'YES';
+        }
+
+        function showMessage(text, type) {
+            const messageBox = document.getElementById('message-box');
+            let bgColor = '';
+            
+            switch (type) {
+                case 'success':
+                    bgColor = 'bg-green-700';
+                    break;
+                case 'error':
+                    bgColor = 'bg-red-700';
+                    break;
+                case 'info':
+                    bgColor = 'bg-blue-700'; // New color for info message
+                    break;
+                default:
+                    bgColor = 'bg-gray-700';
+            }
+
+            messageBox.textContent = text;
+            messageBox.className = `p-3 rounded-lg text-center ${bgColor}`;
+            setTimeout(() => {
+                messageBox.textContent = '';
+                messageBox.className = '';
+            }, 5000); // Increased duration to see the message better
+        }
+
+        function changeView(newView) {
+            window.appState.view = newView;
+            renderContent();
+        }
+        window.changeView = changeView; // Make function globally accessible
+
+        // --- VIEW RENDERING ---
+
+        function renderContent() {
+            if (!isAuthReady) {
+                document.getElementById('app-content').innerHTML = '<div class="spinner my-8"></div><p class="text-center text-gray-500">Authenticating...</p>';
+                return;
+            }
+            
+            const contentDiv = document.getElementById('app-content');
+            let html = '';
+
+            switch (window.appState.view) {
+                case 'recipes':
+                    html = renderRecipesView();
+                    break;
+                case 'inventory':
+                    html = renderInventoryView();
+                    break;
+                case 'meal_plan':
+                    html = renderMealPlanView();
+                    break;
+                case 'reports':
+                    html = renderReportsView();
+                    break;
+            }
+            contentDiv.innerHTML = html;
+            
+            // Update active navigation button
+            document.querySelectorAll('.nav-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.getElementById(`nav-${window.appState.view}`).classList.add('active');
+        }
+
+        function renderRecipesView() {
+            const recipeListHtml = window.appState.recipes.length > 0
+                ? window.appState.recipes.map(r => `
+                    <div class="card p-4 flex justify-between items-center mb-2">
+                        <div>
+                            <p class="font-bold text-lg">${r.title}</p>
+                            <p class="text-gray-400 text-sm">${r.cuisine} - ${r.servings} Servings</p>
+                            <!-- Display Ingredients for completeness -->
+                            <p class="text-gray-500 text-xs mt-1">Ingredients: ${r.ingredients ? r.ingredients.map(i => `${i.quantity} ${i.unit} ${i.name}`).join(', ') : 'None listed (Placeholder)'}</p>
+                        </div>
+                        <button onclick="deleteRecipe('${r.id}')" class="text-red-400 hover:text-red-500 transition">
+                            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 112 0v6a1 1 0 11-2 0V8z" clip-rule="evenodd"></path></svg>
+                        </button>
+                    </div>
+                `).join('')
+                : '<p class="text-center text-gray-500 py-8">No recipes found. Add one above!</p>';
+
+            return `
+                <div class="space-y-6">
+                    <div class="card p-6">
+                        <h3 class="text-xl font-semibold mb-4 text-green-400">Add New Recipe</h3>
+                        <form onsubmit="addRecipe(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <input type="text" name="title" placeholder="Recipe Title (e.g., Pasta)" required class="input-style md:col-span-2">
+                            <input type="text" name="cuisine" placeholder="Cuisine (e.g., Italian)" class="input-style">
+                            <input type="number" name="servings" placeholder="Servings" required min="1" class="input-style">
+                            <button type="submit" class="btn-primary p-3 w-full md:col-span-3">Save Recipe</button>
+                        </form>
+                    </div>
+                    <h3 class="text-xl font-semibold text-green-400">Your Recipe Book</h3>
+                    ${recipeListHtml}
+                </div>
+            `;
+        }
+
+        function renderInventoryView() {
+            const inventoryListHtml = Object.keys(window.appState.inventory).map(name => {
+                const item = window.appState.inventory[name];
+                const color = item.quantity < 5 ? 'text-yellow-400' : 'text-green-400';
+                return `
+                    <div class="card p-4 flex justify-between items-center mb-2">
+                        <p class="font-bold text-lg">${name}</p>
+                        <p class="${color} font-mono">${item.quantity} ${item.unit}</p>
+                    </div>
+                `;
+            }).join('');
+            
+            return `
+                <div class="space-y-6">
+                    <div class="card p-6">
+                        <h3 class="text-xl font-semibold mb-4 text-green-400">Update Ingredient Stock</h3>
+                        <form onsubmit="updateInventory(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <input type="text" name="name" placeholder="Ingredient Name (e.g., Flour)" required class="input-style">
+                            <input type="number" step="any" name="quantityChange" placeholder="Amount to Add/Subtract" required class="input-style">
+                            <input type="text" name="unit" placeholder="Unit (optional, e.g., kg)" class="input-style">
+                            <button type="submit" class="btn-primary p-3 w-full md:col-span-3">Update Stock</button>
+                        </form>
+                        <p class="text-sm text-gray-500 mt-2">Use a negative number to subtract stock.</p>
+                    </div>
+                    <h3 class="text-xl font-semibold text-green-400">Current Inventory</h3>
+                    ${inventoryListHtml || '<p class="text-center text-gray-500 py-8">Inventory is empty.</p>'}
+                </div>
+            `;
+        }
+        
+        const daysOfWeek = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+        function renderMealPlanView() {
+            const mealPlanHtml = daysOfWeek.map(day => {
+                const item = window.appState.mealPlan[day];
+                const recipeTitle = item ? item.title : 'No Meal Set';
+                const buttonHtml = item 
+                    ? `<button onclick="clearMealPlan('${day}')" class="text-sm text-red-400 hover:text-red-500 transition">Clear</button>`
+                    : '';
+                return `
+                    <div class="card p-4 flex justify-between items-center mb-2">
+                        <div class="font-bold w-1/4">${day}</div>
+                        <div class="w-1/2">${recipeTitle}</div>
+                        <div class="w-1/4 text-right">${buttonHtml}</div>
+                    </div>
+                `;
+            }).join('');
+
+            const recipeOptions = window.appState.recipes.map(r => 
+                `<option value="${r.id}">${r.title} (${r.servings} Servings)</option>`
+            ).join('');
+
+            return `
+                <div class="space-y-6">
+                    <div class="card p-6">
+                        <h3 class="text-xl font-semibold mb-4 text-green-400">Set Weekly Meal</h3>
+                        <form onsubmit="setMealPlan(event)" class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <select name="day" required class="input-style">
+                                <option value="">Select Day</option>
+                                ${daysOfWeek.map(d => `<option value="${d}">${d}</option>`).join('')}
+                            </select>
+                            <select name="recipeId" required class="input-style md:col-span-2">
+                                <option value="">Select Recipe</option>
+                                ${recipeOptions}
+                            </select>
+                            <button type="submit" class="btn-primary p-3 w-full md:col-span-3">Plan Meal</button>
+                        </form>
+                    </div>
+                    <h3 class="text-xl font-semibold text-green-400">This Week's Plan</h3>
+                    ${mealPlanHtml}
+                </div>
+            `;
+        }
+
+        function renderReportsView() {
+            // --- SIMULATION 1: Shopping List Report ---
+            const shoppingList = daysOfWeek.reduce((acc, day) => {
+                const plan = window.appState.mealPlan[day];
+                if (plan) {
+                    const recipe = window.appState.recipes.find(r => r.id === plan.recipeId);
+                    if (recipe && recipe.ingredients) {
+                        // Aggregating ingredients from the planned recipes
+                        recipe.ingredients.forEach(ing => {
+                            const key = `${ing.name}|${ing.unit}`;
+                            acc[key] = (acc[key] || 0) + ing.quantity;
+                        });
+                    }
+                }
+                return acc;
+            }, {});
+
+            const shoppingListHtml = Object.keys(shoppingList).map(key => {
+                const [name, unit] = key.split('|');
+                const quantity = shoppingList[key];
+                
+                // --- INTEGRATION: Check stock for shopping list items ---
+                const inventoryItem = window.appState.inventory[name];
+                const needed = quantity;
+                const stocked = inventoryItem ? inventoryItem.quantity : 0;
+                const statusIcon = stocked >= needed ? '✅ Stocked' : `⚠️ Need ${Math.max(0, needed - stocked)}`;
+                const statusColor = stocked >= needed ? 'text-green-400' : 'text-yellow-500';
+
+                return `<li class="flex justify-between border-b border-gray-700 py-2">
+                            <span class="text-lg">${name} (${quantity} ${unit})</span> 
+                            <span class="${statusColor} font-semibold">${statusIcon}</span>
+                        </li>`;
+            }).join('');
+            
+            // --- SIMULATION 2: Stock Check (Can Cook Status) ---
+            const stockCheck = window.appState.recipes.map(recipe => {
+                // Simplified Stock Check: Assumes all ingredients must be fully stocked to 'Ready'
+                let isReady = true;
+                if (recipe.ingredients) {
+                    for (const ing of recipe.ingredients) {
+                        const stocked = window.appState.inventory[ing.name]?.quantity || 0;
+                        if (stocked < ing.quantity) {
+                            isReady = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // If no ingredients defined, assume ready
+                    isReady = true;
+                }
+                
+                const status = isReady ? 'Ready to Cook' : 'Missing Ingredients';
+                const statusColor = isReady ? 'text-green-400' : 'text-red-400';
+                return `<div class="p-2 border-b border-gray-700 flex justify-between">${recipe.title}<span class="${statusColor} font-semibold">${status}</span></div>`;
+            }).join('');
+
+            return `
+                <div class="space-y-8">
+                    <div class="card p-6">
+                        <h3 class="text-xl font-semibold mb-4 text-green-400">🛒 Shopping List & Stock Comparison</h3>
+                        <p class="text-gray-400 mb-4">Aggregated ingredients needed for the current Meal Plan, compared against inventory.</p>
+                        <ul class="space-y-2">
+                            ${shoppingListHtml || '<p class="text-center text-gray-500">Plan your meals to generate a list.</p>'}
+                        </ul>
+                    </div>
+                    
+                    <div class="card p-6">
+                        <h3 class="text-xl font-semibold mb-4 text-green-400">🧪 Recipe Readiness Simulation</h3>
+                        <p class="text-gray-400 mb-4">Checks if you have sufficient stock to cook each recipe.</p>
+                        <div class="bg-[#0d1117] rounded p-4">
+                            ${stockCheck || '<p class="text-center text-gray-500">Add some recipes and inventory items first.</p>'}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Initialize Firebase on load
+        window.onload = initializeFirebase;
+
+    </script>
+</head>
+<body class="p-4 md:p-8 min-h-screen">
+    <div class="max-w-4xl mx-auto">
+        <!-- Header -->
+        <header class="text-center mb-6">
+            <h1 class="text-3xl font-bold text-green-400">The Ultimate Kitchen Manager</h1>
+            <p id="user-id-display" class="text-sm text-gray-500 mt-1"></p>
+        </header>
+
+        <!-- Global Message Box -->
+        <div id="message-box" class="mb-4 transition-all duration-300"></div>
+
+        <!-- Navigation Bar -->
+        <nav class="flex justify-center card p-2 mb-8 sticky top-0 z-10">
+            <button id="nav-recipes" onclick="changeView('recipes')" class="nav-button p-3 flex-1 text-center font-medium rounded-lg active hover:bg-[#21262d]">📚 Recipes</button>
+            <button id="nav-inventory" onclick="changeView('inventory')" class="nav-button p-3 flex-1 text-center font-medium rounded-lg hover:bg-[#21262d]">🥕 Inventory</button>
+            <button id="nav-meal_plan" onclick="changeView('meal_plan')" class="nav-button p-3 flex-1 text-center font-medium rounded-lg hover:bg-[#21262d]">📋 Plan</button>
+            <button id="nav-reports" onclick="changeView('reports')" class="nav-button p-3 flex-1 text-center font-medium rounded-lg hover:bg-[#21262d]">📊 Reports</button>
+        </nav>
+
+        <!-- Main Content Area (Dynamically Rendered) -->
+        <main id="app-content" class="min-h-[500px]">
+            <div class="spinner my-8"></div>
+            <p class="text-center text-gray-500">Loading application...</p>
+        </main>
+    </div>
+</body>
+</html>
